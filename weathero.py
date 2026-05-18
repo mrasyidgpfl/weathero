@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import statistics
 
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -12,13 +13,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 HTTP_TIMEOUT_SECONDS = 30.0
 DB_PATH = Path(os.getenv("WEATHERO_DB", "weathero.db"))
+
+def _adapt_date(d: date) -> str:
+    return d.isoformat()
+
+
+def _convert_date(s: bytes) -> date:
+    return date.fromisoformat(s.decode())
+
+
+sqlite3.register_adapter(date, _adapt_date)
+sqlite3.register_converter("DATE", _convert_date)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS locations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,
     latitude    REAL NOT NULL,
     longitude   REAL NOT NULL,
-    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -47,17 +60,13 @@ class LocationCreate(BaseModel):
 
 class Location(LocationCreate):
     """A monitored location with persistence metadata."""
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
     created_at: datetime
 
 
 class Observation(BaseModel):
     """A single temperature observation at a location on a date."""
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
+    id: int | None = None
     location_id: int
     observed_on: date
     temperature_celsius: float = Field(..., ge=-100, le=70)
@@ -119,7 +128,9 @@ def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA)
 
-# Weather Data Source
+
+# Weather data source
+
 class _OpenMeteoDaily(BaseModel):
     """Internal model matching Open-Meteo's daily response shape."""
     time: list[date]
@@ -165,7 +176,6 @@ def fetch_observations(
             continue
         observations.append(
             Observation(
-                id=0,
                 location_id=location.id,
                 observed_on=obs_date,
                 temperature_celsius=temp,
@@ -174,28 +184,106 @@ def fetch_observations(
     return observations
 
 
+# Analysis
+
+def save_observations(observations: list[Observation]) -> int:
+    """Persist a batch of observations, skipping duplicates on (location, date).
+
+    Returns the number of rows actually inserted.
+    """
+    if not observations:
+        return 0
+    rows = [
+        (obs.location_id, obs.observed_on, obs.temperature_celsius)
+        for obs in observations
+    ]
+    with get_connection() as conn:
+        cursor = conn.executemany(
+            """
+            INSERT OR IGNORE INTO observations
+                (location_id, observed_on, temperature_celsius)
+            VALUES (?, ?, ?)
+            """,
+            rows,
+        )
+        return cursor.rowcount
+
+
+def get_observations(
+    location_id: int,
+    start: date,
+    end: date,
+) -> list[Observation]:
+    """Fetch stored observations for a location within an inclusive date range."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, location_id, observed_on, temperature_celsius
+            FROM observations
+            WHERE location_id = ?
+                AND observed_on BETWEEN ? AND ?
+            ORDER BY observed_on
+            """,
+            (location_id, start, end),
+        ).fetchall()
+    return [Observation.model_validate(dict(row)) for row in rows]
+
+
+def compute_baseline(
+    location_id: int,
+    period_start: date,
+    period_end: date,
+) -> Baseline:
+    """Compute mean and sample standard deviation over a reference period.
+
+    Raises ValueError if fewer than two observations exist in the period
+    (need at least 2 points to compute a sample std).
+    """
+    observations = get_observations(location_id, period_start, period_end)
+    if len(observations) < 2:
+        raise ValueError(
+            f"Need at least 2 observations to compute baseline, got {len(observations)}"
+        )
+    temps = [obs.temperature_celsius for obs in observations]
+    return Baseline(
+        location_id=location_id,
+        period_start=period_start,
+        period_end=period_end,
+        mean_celsius=statistics.mean(temps),
+        std_celsius=statistics.stdev(temps),
+        sample_count=len(temps),
+    )
+
+
+def detect_anomalies(
+    observations: list[Observation],
+    baseline: Baseline,
+    threshold_sigmas: float = 2.0,
+) -> list[Anomaly]:
+    """Flag observations deviating from baseline by more than threshold_sigmas."""
+    if baseline.std_celsius == 0:
+        return []
+    anomalies: list[Anomaly] = []
+    for obs in observations:
+        deviation = (obs.temperature_celsius - baseline.mean_celsius) / baseline.std_celsius
+        if abs(deviation) >= threshold_sigmas:
+            anomalies.append(
+                Anomaly(
+                    location_id=obs.location_id,
+                    observed_on=obs.observed_on,
+                    observed_celsius=obs.temperature_celsius,
+                    expected_celsius=baseline.mean_celsius,
+                    deviation_sigmas=deviation,
+                )
+            )
+    return anomalies
+
+
 # Entry point
 
 def main() -> None:
     init_db()
     print(f"weathero ready, DB at {DB_PATH.resolve()}")
-
-    # Smoke test: fetch a week of Edinburgh weather
-    edinburgh = Location(
-        id=1,
-        name="Edinburgh",
-        latitude=55.9533,
-        longitude=-3.1883,
-        created_at=datetime.now(),
-    )
-    observations = fetch_observations(
-        edinburgh,
-        date(2024, 1, 1),
-        date(2024, 1, 7),
-    )
-    print(f"Fetched {len(observations)} observations")
-    for obs in observations[:3]:
-        print(f"  {obs.observed_on}: {obs.temperature_celsius:.1f}°C")
 
 
 if __name__ == "__main__":
