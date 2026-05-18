@@ -2,12 +2,13 @@ import os
 import sqlite3
 import statistics
 
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterator
 
 import httpx
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
@@ -278,12 +279,136 @@ def detect_anomalies(
             )
     return anomalies
 
+# API
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialise the database on startup."""
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="weathero",
+    description="Detect temperature anomalies at geographic locations against a historical baseline.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+def _get_location_or_404(location_id: int) -> Location:
+    """Fetch a location by ID or raise 404."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id, name, latitude, longitude, created_at FROM locations WHERE id = ?",
+            (location_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Location {location_id} not found")
+    return Location.model_validate(dict(row))
+
+
+@app.post("/locations", response_model=Location, status_code=201)
+def create_location(payload: LocationCreate) -> Location:
+    """Register a new location for monitoring."""
+    with get_connection() as conn:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO locations (name, latitude, longitude) VALUES (?, ?, ?)",
+                (payload.name, payload.latitude, payload.longitude),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail=f"Location '{payload.name}' already exists")
+        row = conn.execute(
+            "SELECT id, name, latitude, longitude, created_at FROM locations WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+    return Location.model_validate(dict(row))
+
+
+@app.get("/locations", response_model=list[Location])
+def list_locations() -> list[Location]:
+    """List all monitored locations."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, name, latitude, longitude, created_at FROM locations ORDER BY id"
+        ).fetchall()
+    return [Location.model_validate(dict(row)) for row in rows]
+
+
+@app.post("/locations/{location_id}/observations/refresh")
+def refresh_observations(
+    location_id: int,
+    start: date = Query(..., description="Start date (inclusive)"),
+    end: date = Query(..., description="End date (inclusive)"),
+) -> dict:
+    """Fetch observations from Open-Meteo for the given range and persist them."""
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be after start")
+    location = _get_location_or_404(location_id)
+    try:
+        observations = fetch_observations(location, start, end)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream weather API error: {exc}") from exc
+    inserted = save_observations(observations)
+    return {
+        "location_id": location_id,
+        "fetched": len(observations),
+        "inserted": inserted,
+    }
+
+
+@app.get("/locations/{location_id}/observations", response_model=list[Observation])
+def list_observations(
+    location_id: int,
+    start: date = Query(..., description="Start date (inclusive)"),
+    end: date = Query(..., description="End date (inclusive)"),
+) -> list[Observation]:
+    """Return stored observations for a location within a date range."""
+    if end < start:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    _get_location_or_404(location_id)
+    return get_observations(location_id, start, end)
+
+
+@app.get("/locations/{location_id}/baseline", response_model=Baseline)
+def get_baseline(
+    location_id: int,
+    period_start: date = Query(..., description="Baseline period start (inclusive)"),
+    period_end: date = Query(..., description="Baseline period end (inclusive)"),
+) -> Baseline:
+    """Compute a statistical baseline for a location over a reference period."""
+    _get_location_or_404(location_id)
+    try:
+        return compute_baseline(location_id, period_start, period_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/locations/{location_id}/anomalies", response_model=list[Anomaly])
+def list_anomalies(
+    location_id: int,
+    baseline_start: date = Query(..., description="Baseline period start"),
+    baseline_end: date = Query(..., description="Baseline period end"),
+    observed_start: date = Query(..., description="Observation window start"),
+    observed_end: date = Query(..., description="Observation window end"),
+    threshold_sigmas: float = Query(2.0, ge=0.5, le=5.0, description="Anomaly threshold in standard deviations"),
+) -> list[Anomaly]:
+    """Detect anomalies in an observation window relative to a baseline."""
+    _get_location_or_404(location_id)
+    try:
+        baseline = compute_baseline(location_id, baseline_start, baseline_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    observations = get_observations(location_id, observed_start, observed_end)
+    return detect_anomalies(observations, baseline, threshold_sigmas)
+
 
 # Entry point
 
 def main() -> None:
-    init_db()
-    print(f"weathero ready, DB at {DB_PATH.resolve()}")
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
 
 if __name__ == "__main__":
