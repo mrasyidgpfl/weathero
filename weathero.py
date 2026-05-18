@@ -1,11 +1,13 @@
 import os
 import sqlite3
 import statistics
+import pytest
 
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterator
+from fastapi.testclient import TestClient
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -403,7 +405,87 @@ def list_anomalies(
     observations = get_observations(location_id, observed_start, observed_end)
     return detect_anomalies(observations, baseline, threshold_sigmas)
 
+# Tests
 
+@pytest.fixture
+def isolated_db(tmp_path, monkeypatch):
+    """Provide a fresh SQLite DB for each test."""
+    db_file = tmp_path / "test.db"
+    monkeypatch.setattr("weathero.DB_PATH", db_file)
+    init_db()
+    yield db_file
+
+
+@pytest.fixture
+def client(isolated_db):
+    """Provide a FastAPI TestClient with an isolated DB."""
+    return TestClient(app)
+
+
+def test_anomaly_detection_math() -> None:
+    """detect_anomalies computes z-scores correctly and respects threshold."""
+    baseline = Baseline(
+        location_id=1,
+        period_start=date(2010, 1, 1),
+        period_end=date(2010, 12, 31),
+        mean_celsius=10.0,
+        std_celsius=2.0,
+        sample_count=365,
+    )
+    observations = [
+        Observation(location_id=1, observed_on=date(2024, 1, 1), temperature_celsius=10.0),  # 0σ
+        Observation(location_id=1, observed_on=date(2024, 1, 2), temperature_celsius=15.0),  # +2.5σ
+        Observation(location_id=1, observed_on=date(2024, 1, 3), temperature_celsius=4.0),   # -3.0σ
+        Observation(location_id=1, observed_on=date(2024, 1, 4), temperature_celsius=13.0),  # +1.5σ
+    ]
+    anomalies = detect_anomalies(observations, baseline, threshold_sigmas=2.0)
+
+    assert len(anomalies) == 2
+    assert anomalies[0].deviation_sigmas == pytest.approx(2.5)
+    assert anomalies[0].direction == "warm"
+    assert anomalies[1].deviation_sigmas == pytest.approx(-3.0)
+    assert anomalies[1].direction == "cold"
+
+
+def test_baseline_rejects_inverted_period() -> None:
+    """Baseline model rejects period_end <= period_start."""
+    with pytest.raises(ValueError, match="period_end must be after period_start"):
+        Baseline(
+            location_id=1,
+            period_start=date(2020, 1, 1),
+            period_end=date(2010, 1, 1),
+            mean_celsius=10.0,
+            std_celsius=2.0,
+            sample_count=100,
+        )
+
+
+def test_api_end_to_end(client) -> None:
+    """Create a location, seed observations, compute baseline via API."""
+    # Create a location
+    response = client.post("/locations", json={
+        "name": "TestLoc", "latitude": 0.0, "longitude": 0.0,
+    })
+    assert response.status_code == 201
+    location_id = response.json()["id"]
+
+    # Seed observations directly (skip Open-Meteo round-trip)
+    observations = [
+        Observation(location_id=location_id, observed_on=date(2010, 1, d), temperature_celsius=10.0 + d * 0.1)
+        for d in range(1, 31)
+    ]
+    save_observations(observations)
+
+    # Compute baseline via the API
+    response = client.get(
+        f"/locations/{location_id}/baseline",
+        params={"period_start": "2010-01-01", "period_end": "2010-01-30"},
+    )
+    assert response.status_code == 200
+    baseline = response.json()
+    assert baseline["sample_count"] == 30
+    assert baseline["mean_celsius"] == pytest.approx(11.55, abs=0.01)
+    
 # Entry point
 
 def main() -> None:
